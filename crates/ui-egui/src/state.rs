@@ -23,6 +23,8 @@ pub enum Screen {
     /// Advanced mode's workbench: every tool on the open target. Projects and their builds keep
     /// their own screens beside it, so nothing being built goes out of sight.
     Workbench,
+    /// A module's own section (`crate::module_ui`), such as RevIn.
+    Module,
 }
 
 /// What the person is about to make (the Home prompt).

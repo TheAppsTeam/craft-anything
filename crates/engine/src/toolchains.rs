@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn the_shared_catalogue_is_complete() {
         let parsed: Table = toml::from_str(include_str!("toolchains.toml")).unwrap();
-        assert_eq!(parsed.toolchain.len(), 8);
+        assert_eq!(parsed.toolchain.len(), 9);
         for tool in catalogue() {
             assert!(!tool.found_by.is_empty() && !tool.build.is_empty() && !tool.test.is_empty(), "{tool:?}");
             for recipe in &tool.launch {

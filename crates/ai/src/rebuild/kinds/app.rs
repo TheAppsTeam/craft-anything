@@ -54,6 +54,12 @@ impl TargetKind for AppKind {
         if cx.deep && matches!(cx.ws.manifest.target, TargetRef::Local { .. }) {
             s.push(decompile_note(false, cx.ghidra).trim_start().to_string());
             s.push(mechanics::MECHANICS_CONTRACT.to_string());
+            if crate::rebuild::revin::studied(&cx.ws.capture_dir()) {
+                s.push(crate::rebuild::revin::ROUTING_BRIEF.to_string());
+            }
+            if crate::rebuild::revin::seeded(&cx.ws.app_dir()) {
+                s.push(crate::rebuild::revin::RECOVERED_BRIEF.to_string());
+            }
         }
         // A console program is compared by its runs, not pictured.
         if runs::captured(cx.ws).is_empty() {

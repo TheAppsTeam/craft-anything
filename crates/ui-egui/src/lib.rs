@@ -28,6 +28,7 @@ pub mod make;
 pub mod manage;
 #[cfg(target_os = "macos")]
 pub mod menu;
+pub mod module_ui;
 pub mod palette;
 pub mod paste;
 pub mod pins;
@@ -475,6 +476,8 @@ pub struct CraftApp {
     pub menu_bar: Option<menu::MenuBar>,
     pub view: SessionView,
     pub jobs: jobs::Jobs<Done>,
+    /// The open module's screen (`module_ui`): a plugin marked `module = true`.
+    pub module: Option<module_ui::ModuleView>,
     pub conversation: Option<Box<dyn Conversation>>,
     pub backends: Vec<BackendConfig>,
     /// Each backend's options (an agent app's program and model), by name (Settings → AI).
@@ -630,6 +633,7 @@ impl CraftApp {
             settings,
             first_frames: None,
             persist: true,
+            module: None,
             headless: false,
             #[cfg(target_os = "macos")]
             menu_bar: None,
@@ -1063,6 +1067,19 @@ impl CraftApp {
         })
     }
 
+    /// Like [`CraftApp::act`], but listed in Jobs, where it can be followed and stopped: for
+    /// module tools, which can run for a long time.
+    pub fn act_visible(&mut self, tool: &'static str, params: Value, title: String) -> u64 {
+        let engine = self.engine.clone();
+        let scope = params.clone();
+        self.jobs.spawn(title, true, move |j| {
+            let progress = j.reporter();
+            let opts = CallOptions::new(Caller::Ui).with_consent(Consent::Granted).with_cancel(j.cancel.clone()).with_progress(&progress);
+            let result = engine.call(tool, params, opts).map(|o| o.to_json().get("result").cloned().unwrap_or(Value::Null));
+            Ok(Done::Acted { tool, params: scope, result })
+        })
+    }
+
     /// Open a browser window on a website for the person to sign in to it themselves, so studies
     /// of that site see it signed in (`web_site_sign_in`). One window at a time, and not while a
     /// new project is being made: its build would start and study the site before the sign-in ends.
@@ -1073,6 +1090,10 @@ impl CraftApp {
     }
 
     fn acted(&mut self, job: u64, tool: &str, params: &Value, result: Result<Value, ToolError>) {
+        if module_ui::is_module_tool(tool) {
+            module_ui::done(self, job, tool, result);
+            return;
+        }
         match (tool, result) {
             ("project_preview", Ok(v)) => {
                 let url = v.get("url").and_then(Value::as_str).map(str::to_string);
@@ -2077,6 +2098,7 @@ impl CraftApp {
                     Screen::Ask => chat::ask_screen(self, ui),
                     Screen::Project => project::show(self, ui),
                     Screen::GameFiles => game_files::show(self, ui),
+                    Screen::Module => module_ui::show(self, ui),
                 })
             });
         } else {

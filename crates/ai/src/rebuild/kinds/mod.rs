@@ -5,6 +5,8 @@
 
 mod app;
 mod game;
+pub mod ios_sim;
+pub mod ios_tabs;
 pub mod mechanics;
 pub mod own;
 pub mod plugin_check;

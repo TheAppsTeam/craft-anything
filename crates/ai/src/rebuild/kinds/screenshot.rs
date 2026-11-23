@@ -51,17 +51,28 @@ impl Check for ScreenshotCheck {
         let (ws, round) = (cx.ws, cx.round);
         let dir = ws.checks_dir().join(format!("round-{round}"));
         let shot = dir.join("screenshot.png");
-        let (bytes, program, base_args) = match run_with(cx, "--screenshot", &shot)? {
-            OwnRun::NoProgram => return Ok(CheckResult::new(self.id(), round, false, NO_PROGRAM)),
-            OwnRun::NoFile(why) => {
-                return Ok(CheckResult::new(
-                    self.id(),
-                    round,
-                    false,
-                    format!("The program didn't save a picture with --screenshot.{why} {SCREENSHOT_CONTRACT}"),
-                ));
+        // An iOS build runs in the iOS Simulator, not on the Mac: photograph it there.
+        let ios = super::ios_sim::simulator_app(&ws.app_dir());
+        let (bytes, own) = if let Some(app) = &ios {
+            match super::ios_sim::screenshot(app, &shot) {
+                Ok(bytes) => (bytes, None),
+                Err(why) => {
+                    return Ok(CheckResult::new(self.id(), round, false, format!("The iOS build couldn't be photographed in the iOS Simulator: {why}")));
+                }
             }
-            OwnRun::Saved { bytes, program, args } => (bytes, program, args),
+        } else {
+            match run_with(cx, "--screenshot", &shot)? {
+                OwnRun::NoProgram => return Ok(CheckResult::new(self.id(), round, false, NO_PROGRAM)),
+                OwnRun::NoFile(why) => {
+                    return Ok(CheckResult::new(
+                        self.id(),
+                        round,
+                        false,
+                        format!("The program didn't save a picture with --screenshot.{why} {SCREENSHOT_CONTRACT}"),
+                    ));
+                }
+                OwnRun::Saved { bytes, program, args } => (bytes, Some((program, args))),
+            }
         };
         let mut artifacts: Vec<PathBuf> = shot.strip_prefix(&ws.root).ok().map(Path::to_path_buf).into_iter().collect();
         let img = match decode_png(&bytes) {
@@ -87,6 +98,8 @@ impl Check for ScreenshotCheck {
         // The person's pictures, and the picture of the original running (runtime study).
         let mut pictures = ws.references();
         pictures.extend(Some(ws.capture_dir().join("window.png")).filter(|p| p.is_file()));
+        // The original's screens on an iPhone, photographed by RevIn in the Simulator.
+        pictures.extend(crate::rebuild::revin::original_screens(&ws.capture_dir()));
         let bar = cx.build_settings().picture_good_enough;
         let mut similarity = None;
         let note = match picture_likeness(&img, &pictures) {
@@ -103,7 +116,17 @@ impl Check for ScreenshotCheck {
             ),
             Likeness::NoPictures => format!("The program starts and draws ({}×{}).", img.width, img.height),
         };
-        let (running, claims) = running_note(cx, &program, &base_args, &dir);
+        // The original's desktop window is compared with a desktop build started normally.
+        let (mut running, mut claims) = match &own {
+            Some((program, base_args)) => running_note(cx, program, base_args, &dir),
+            None => (String::new(), Vec::new()),
+        };
+        // An iOS build is also compared with the original tab by tab, when RevIn ran the original.
+        if let Some(app) = &ios {
+            let (tabs, tab_claims) = super::ios_tabs::tabs_note(cx, app, &dir);
+            running.push_str(&tabs);
+            claims.extend(tab_claims);
+        }
         let note = note + &running;
         artifacts.extend(dir.join("window.png").strip_prefix(&ws.root).ok().map(Path::to_path_buf).filter(|p| ws.root.join(p).is_file()));
         Ok(CheckResult { artifacts, similarity, good_enough: bar, claims, ..CheckResult::new(self.id(), round, true, note) })

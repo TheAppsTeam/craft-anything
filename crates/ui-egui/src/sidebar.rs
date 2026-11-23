@@ -60,6 +60,13 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
             app.state.screen = Screen::Workbench;
             app.ensure_rail_loaded();
         }
+        // Modules (plugins marked `module = true`), each with its own screen.
+        for (id, name) in craft_anything_engine::plugins::modules(&app.settings.plugins) {
+            let on = app.state.screen == Screen::Module && app.module.as_ref().is_some_and(|m| m.id == id);
+            if row(ui, "puzzle", &name, None, on).clicked() {
+                crate::module_ui::open(app, &id, &name);
+            }
+        }
         section_gap(ui, fold, 18.0);
         // Pinned builds, between the screens and the projects, to open in one click.
         crate::pins::section(app, ui, fold);

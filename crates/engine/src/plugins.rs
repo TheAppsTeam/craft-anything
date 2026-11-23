@@ -69,6 +69,17 @@ pub struct McpPlugin {
     /// Ask before each call (it runs someone else's code). Default true.
     #[serde(default = "yes")]
     pub consent: bool,
+    /// A module: shown as its own section of the app, whose tools are read live from the running
+    /// server (so tools it adds while the app is open appear at once), besides the cached ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub module: bool,
+    /// Files or folders the server is made from. When one is newer than the cached tool list, the
+    /// list is read again at start, so a changed server's tools are offered without a manual refresh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<PathBuf>,
+    /// How long one call may take, in seconds (default 15 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_timeout_secs: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -122,6 +133,55 @@ impl McpPlugin {
     pub fn cached_tools(&self, config: &std::path::Path) -> Vec<RemoteTool> {
         std::fs::read(self.cache_path(config)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
+
+    /// The newest modification time among the watched files (folders are walked, a few levels
+    /// deep, skipping hidden entries and build output).
+    pub fn watched_mtime(&self) -> Option<std::time::SystemTime> {
+        fn newest(path: &std::path::Path, depth: u32, best: &mut Option<std::time::SystemTime>, seen: &mut u32) {
+            if *seen > 20_000 {
+                return;
+            }
+            *seen += 1;
+            let Ok(meta) = std::fs::metadata(path) else { return };
+            if meta.is_dir() {
+                if depth == 0 {
+                    return;
+                }
+                let Ok(entries) = std::fs::read_dir(path) else { return };
+                for e in entries.flatten() {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with('.') || ["target", "node_modules", "__pycache__", "build", "dist"].contains(&name.as_ref()) {
+                        continue;
+                    }
+                    newest(&e.path(), depth - 1, best, seen);
+                }
+            } else if let Ok(m) = meta.modified()
+                && best.is_none_or(|b| m > b)
+            {
+                *best = Some(m);
+            }
+        }
+        let mut best = None;
+        let mut seen = 0;
+        for w in &self.watch {
+            newest(w, 4, &mut best, &mut seen);
+        }
+        best
+    }
+
+    /// The cached tool list is missing or older than a watched file.
+    pub fn cache_is_stale(&self, config: &std::path::Path) -> bool {
+        if self.watch.is_empty() && !self.module {
+            return false;
+        }
+        let Ok(cached) = std::fs::metadata(self.cache_path(config)).and_then(|m| m.modified()) else { return true };
+        self.watched_mtime().is_some_and(|w| w > cached)
+    }
+
+    fn call_timeout(&self) -> Duration {
+        self.call_timeout_secs.map_or(CALL_TIMEOUT, Duration::from_secs)
+    }
 }
 
 /// `[plugins]` in config.toml.
@@ -132,6 +192,16 @@ pub struct PluginSettings {
     /// WASM component plugins (`crate::wasm_plugins`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wasm: Vec<crate::wasm_plugins::WasmPluginConfig>,
+}
+
+/// The live tool list of a module (`<id>_module_tools`).
+pub const MODULE_TOOLS: &str = "module_tools";
+/// Call any tool of a module by its name there (`<id>_module_call`), including ones added since start.
+pub const MODULE_CALL: &str = "module_call";
+
+/// The modules among the configured plugins: (id, name), in config order.
+pub fn modules(settings: &PluginSettings) -> Vec<(String, String)> {
+    settings.mcp.iter().filter(|p| p.enabled && p.module && p.problem().is_none()).map(|p| (p.id.clone(), p.display_name().to_string())).collect()
 }
 
 /// One proxied tool: which server, and the tool's name there.
@@ -196,6 +266,15 @@ pub fn install(session: &mut Session) -> Vec<RuntimeTool> {
         }
         let Some(set) = custom_toolset(&p.id) else { continue };
         let remote = matches!(p.server(), Server::Url(_));
+        if p.cache_is_stale(&config) {
+            match refresh(p, &config) {
+                Ok(t) => log::info!("plugin {}: read {} tools again (its files changed)", p.id, t.len()),
+                Err(e) => log::warn!("plugin {}: couldn't read its tools again: {}", p.id, e.message),
+            }
+        }
+        if p.module {
+            module_tools(p, set, remote, &mut plugins, &mut tools);
+        }
         for t in p.cached_tools(&config).into_iter().take(MAX_TOOLS) {
             let mut id = format!("{}_{}", p.id, id_part(&t.name));
             id.truncate(64);
@@ -223,6 +302,98 @@ pub fn install(session: &mut Session) -> Vec<RuntimeTool> {
     session.ext.insert(Arc::new(plugins));
     crate::wasm_plugins::install(session, &mut tools);
     tools
+}
+
+/// The two tools that make a plugin a module: its live tool list and a call by name.
+fn module_tools(p: &McpPlugin, set: crate::tool::Toolset, remote: bool, plugins: &mut Plugins, tools: &mut Vec<RuntimeTool>) {
+    let base = if remote { Effects::ACCESSES_NETWORK } else { Effects::LAUNCHES_PROCESS };
+    let foreign = if p.consent { Effects::EXECUTES_FOREIGN_CODE } else { Effects::empty() };
+    let specs: [(&str, String, String, Effects, Value, crate::tool::ToolFn); 2] = [
+        (
+            MODULE_TOOLS,
+            format!("{}: its tools now", p.display_name()),
+            format!("Read the {} module's tools from the running server, including ones added since the app started.", p.display_name()),
+            base | Effects::MUTATES_SESSION | foreign,
+            json!({"type": "object", "properties": {}}),
+            module_tools_live,
+        ),
+        (
+            MODULE_CALL,
+            format!("{}: run a tool", p.display_name()),
+            format!("Run one of the {} module's tools by its name there, with its arguments.", p.display_name()),
+            base | Effects::MUTATES_SESSION | Effects::WRITES_FILESYSTEM | Effects::ACCESSES_NETWORK | foreign,
+            json!({"type": "object", "properties": {"tool": {"type": "string", "description": "The tool's name in the module"}, "arguments": {"type": "object", "description": "Its arguments"}}, "required": ["tool"]}),
+            module_call,
+        ),
+    ];
+    for (suffix, title, summary, effects, schema, run) in specs {
+        let id = format!("{}_{suffix}", p.id);
+        if !RuntimeTool::valid_id(&id) || tools.iter().any(|x| x.id == id) {
+            log::error!("module {}: tool id {id:?} is invalid or taken", p.id);
+            continue;
+        }
+        let leaked: &'static str = Box::leak(id.clone().into_boxed_str());
+        plugins.routes.insert(leaked, Route { server: p.id.clone(), remote: String::new() });
+        tools.push(RuntimeTool {
+            id,
+            title,
+            summary,
+            beginner: format!("Part of the {} module.", p.display_name()),
+            toolset: set,
+            effects,
+            requires: Requires::Nothing,
+            schema,
+            run,
+        });
+    }
+}
+
+/// Run `f` with the server behind `ctx.tool`, starting it if needed; a server that died is started
+/// again on the next call.
+fn with_server<T>(ctx: &mut Ctx<'_>, f: impl FnOnce(&McpPlugin, &mut McpClient, &Route) -> Result<T, ToolError>) -> Result<(McpPlugin, T), ToolError> {
+    let plugins = ctx.session.ext.get::<Plugins>().ok_or_else(|| ToolError::internal("plugins aren't loaded in this session"))?;
+    let route = plugins.routes.get(ctx.tool).ok_or_else(|| ToolError::internal(format!("no plugin serves {}", ctx.tool)))?;
+    let (plugin, client) = plugins.servers.get(&route.server).ok_or_else(|| ToolError::internal(format!("plugin {} isn't loaded", route.server)))?;
+    let mut slot = client.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.is_none() {
+        ctx.report(None, format!("Starting the {} plugin…", plugin.display_name()));
+        *slot = Some(start(plugin, &ctx.session.config_dir())?);
+    }
+    let Some(c) = slot.as_mut() else { return Err(ToolError::internal("plugin client missing")) };
+    match f(plugin, c, route) {
+        Ok(v) => Ok((plugin.clone(), v)),
+        Err(e) => {
+            if e.code == ErrorCode::EngineMissing {
+                *slot = None;
+            }
+            Err(e)
+        }
+    }
+}
+
+fn module_tools_live(ctx: &mut Ctx<'_>, _params: Value) -> Result<ToolOutput, ToolError> {
+    let (plugin, tools) = with_server(ctx, |_, c, _| c.list_tools(START_TIMEOUT))?;
+    let modified = plugin.watched_mtime().and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs());
+    Ok(ToolOutput::Value(json!({"module": plugin.id, "name": plugin.display_name(), "tools": tools, "watched_modified": modified})))
+}
+
+#[derive(Deserialize)]
+struct ModuleCall {
+    tool: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+fn module_call(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
+    let call: ModuleCall = serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
+    if call.tool.trim().is_empty() {
+        return Err(ToolError::invalid("tool is empty"));
+    }
+    let cancel = ctx.cancel.clone();
+    let args = if call.arguments.is_null() { json!({}) } else { call.arguments.clone() };
+    let name = call.tool.clone();
+    let (plugin, result) = with_server(ctx, move |p, c, _| c.call_tool(&name, args, p.call_timeout(), &move || cancel.is_cancelled()))?;
+    record(ctx, &plugin, params, result)
 }
 
 /// Start a server, list its tools and cache them. New tools are offered from the next start.
@@ -283,27 +454,14 @@ fn logged(p: &McpPlugin, config: &std::path::Path, e: ToolError) -> ToolError {
 /// The function behind every proxied tool: route by [`Ctx::tool`], start the server if needed,
 /// call it, and record the result as evidence.
 fn call_plugin(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
-    let plugins = ctx.session.ext.get::<Plugins>().ok_or_else(|| ToolError::internal("plugins aren't loaded in this session"))?;
-    let route = plugins.routes.get(ctx.tool).ok_or_else(|| ToolError::internal(format!("no plugin serves {}", ctx.tool)))?;
-    let (plugin, client) = plugins.servers.get(&route.server).ok_or_else(|| ToolError::internal(format!("plugin {} isn't loaded", route.server)))?;
-    let mut slot = client.lock().unwrap_or_else(PoisonError::into_inner);
-    if slot.is_none() {
-        ctx.report(None, format!("Starting the {} plugin…", plugin.display_name()));
-        *slot = Some(start(plugin, &ctx.session.config_dir())?);
-    }
-    let Some(c) = slot.as_mut() else { return Err(ToolError::internal("plugin client missing")) };
     let cancel = ctx.cancel.clone();
     let args = if params.is_null() { json!({}) } else { params.clone() };
-    let result = match c.call_tool(&route.remote, args, CALL_TIMEOUT, &move || cancel.is_cancelled()) {
-        Ok(r) => r,
-        Err(e) => {
-            // A server that died is started again on the next call.
-            if e.code == ErrorCode::EngineMissing {
-                *slot = None;
-            }
-            return Err(e);
-        }
-    };
+    let (plugin, result) = with_server(ctx, move |p, c, route| c.call_tool(&route.remote, args, p.call_timeout(), &move || cancel.is_cancelled()))?;
+    record(ctx, &plugin, params, result)
+}
+
+/// A plugin's answer as evidence from an outside service.
+fn record(ctx: &mut Ctx<'_>, plugin: &McpPlugin, params: Value, result: Value) -> Result<ToolOutput, ToolError> {
     let text = content_text(&result);
     let summary: String = if text.is_empty() { format!("{} answered.", plugin.display_name()) } else { text.chars().take(300).collect() };
     let env = Environment {
@@ -364,6 +522,9 @@ mod tests {
             headers: BTreeMap::new(),
             enabled: true,
             consent: true,
+            module: false,
+            watch: vec![],
+            call_timeout_secs: None,
         }
     }
 
@@ -402,6 +563,34 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         assert!(refresh(&remote, other.path()).is_err());
         assert!(!crate::failure_log::dir_in(other.path()).exists(), "no log for a remote server");
+    }
+
+    #[test]
+    fn a_watched_file_newer_than_the_cache_makes_it_stale_and_modules_get_their_two_tools() {
+        let config = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let file = src.path().join("engine.py");
+        std::fs::write(&file, "x").unwrap();
+        let p = McpPlugin { id: "revin_test_mod".into(), module: true, watch: vec![src.path().to_path_buf()], consent: false, ..plugin("revin-mcp") };
+        assert!(p.cache_is_stale(config.path()), "no cache yet");
+        let cache = p.cache_path(config.path());
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, "[]").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(old).unwrap();
+        assert!(!p.cache_is_stale(config.path()), "the cache is newer than the source");
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(std::time::SystemTime::now() + Duration::from_secs(60)).unwrap();
+        assert!(p.cache_is_stale(config.path()), "the source changed after the cache");
+        assert!(!plugin("notes-mcp").cache_is_stale(config.path()), "an ordinary plugin is refreshed by hand");
+
+        let mut tools = Vec::new();
+        let mut plugins = Plugins::default();
+        module_tools(&p, custom_toolset(&p.id).unwrap(), false, &mut plugins, &mut tools);
+        let ids: Vec<_> = tools.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["revin_test_mod_module_tools", "revin_test_mod_module_call"]);
+        assert!(!tools[1].effects.needs_consent(), "consent = false: a trusted module runs without asking");
+        let s = PluginSettings { mcp: vec![p.clone(), McpPlugin { id: "other".into(), ..plugin("x") }], wasm: vec![] };
+        assert_eq!(modules(&s), vec![("revin_test_mod".to_string(), "revin_test_mod".to_string())]);
     }
 
     #[test]

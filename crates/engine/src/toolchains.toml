@@ -3,6 +3,14 @@
 # {file} is replaced with the matched file; wildcard launch matches must be unique.
 
 [[toolchain]]
+name = "Xcode (iOS)"
+found_by = ["*/project.pbxproj"]
+build = ["xcodebuild", "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "CODE_SIGNING_ALLOWED=NO", "SYMROOT=build", "build"]
+test = ["xcodebuild", "-sdk", "iphonesimulator", "-destination", "generic/platform=iOS Simulator", "CODE_SIGNING_ALLOWED=NO", "SYMROOT=build", "build-for-testing"]
+# Tests need a scheme, which only the project knows: without one there's nothing to run.
+no_tests = ["The test action requires that the name of a scheme"]
+
+[[toolchain]]
 name = "Rust"
 found_by = ["Cargo.toml"]
 build = ["cargo", "build", "--quiet"]

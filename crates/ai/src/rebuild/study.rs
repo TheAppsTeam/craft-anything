@@ -108,6 +108,8 @@ impl Worker {
                     Ok(out) => notes.push_str(&describe(&out)),
                     Err(e) => notes.push_str(&format!("A first look failed: {}\n", e.message)),
                 }
+                // RevIn takes the parts it reads best (Swift metadata, names, Kotlin declarations).
+                notes.push_str(&self.revin_study(ws, &path, &program)?);
                 if !program.is_file() && deep {
                     self.step(
                         ws,

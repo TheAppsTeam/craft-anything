@@ -27,6 +27,14 @@ found_by = ["package.json", "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "
 steps = "Use what their request names; otherwise choose the stack yourself: the one that best fits the request and the original. If the request names none and the capture shows what the original is built with (the script and stylesheet addresses in capture.json and page.html, for example /_next/ for Next.js or /_nuxt/ for Nuxt), use the same. For a website, create the project in app/ with a \"build\" script in package.json, then run `npm install` and `npm run build` from app/ until it succeeds: the output must be static files in app/dist, app/out or app/build (index.html at its top and each other page at its own path) that work when served as static files."
 
 [[stack]]
+name = "SwiftUI (iOS)"
+asked_by = [" swiftui ", " ios app ", " iphone app ", " for ios ", " for iphone ", " in swift "]
+program = "xcodebuild"
+program_from = "Install Xcode from the App Store, then open it once"
+found_by = ["project.yml", "*/project.pbxproj"]
+steps = "Build an iOS app in Swift with SwiftUI, for iPhone. Describe the project in app/project.yml for XcodeGen (one iOS application target, deploymentTarget iOS 17.0, sources in app/Sources, a bundle id of your choice) and run `xcodegen generate` in app/, so app/ itself holds exactly one .xcodeproj (not a subfolder: Craft Anything builds it from app/). Then build it for the Simulator from app/ with `xcodebuild -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO SYMROOT=build build` until it succeeds; that's the exact command the build check runs, and the app lands in app/build/Debug-iphonesimulator/. No `--screenshot` option is needed: Craft Anything installs that build on an iPhone simulator, starts it and photographs its first screen, so make the first screen what the original shows first. To look at it yourself: `xcrun simctl install booted <the .app>`, `xcrun simctl launch booted <bundle id>`, `xcrun simctl io booted screenshot app/shots/now.png`."
+
+[[stack]]
 name = "Phaser"
 asked_by = [" in phaser ", " with phaser ", " using phaser ", " use phaser "]
 uses = ["phaser"]
