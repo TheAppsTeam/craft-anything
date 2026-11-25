@@ -118,6 +118,10 @@ pub struct Settings {
     /// (`native_window_capture` into capture/window.png). Off by default: it runs the person's
     /// program.
     pub runtime_study: bool,
+    /// When a module plugin can recover Swift (RevIn), also have it rewrite the original's function
+    /// bodies as Swift from Ghidra's pseudocode during a study, through Claude Code. Off by
+    /// default: it spends the person's Claude plan, and takes a while.
+    pub revin_logic: bool,
     /// Recently opened projects and targets.
     pub recent: Vec<PathBuf>,
     /// Where new projects are created; `None` = `Documents/Craft Anything`.
@@ -215,6 +219,7 @@ impl Default for Settings {
             auto_mode: true,
             questions: None,
             runtime_study: false,
+            revin_logic: false,
             recent: Vec::new(),
             projects_dir: None,
             project_folders: Vec::new(),

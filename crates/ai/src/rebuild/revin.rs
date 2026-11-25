@@ -25,6 +25,10 @@ const SIMULATOR_TOOL: &str = "revin_run_simulator";
 pub(super) const DYNAMIC_DIR: &str = "dynamic";
 /// Where an iOS rebuild starts from RevIn's recovered package, under the app folder.
 pub(super) const RECOVERED_DIR: &str = "Recovered";
+/// Where RevIn's package with the original's functions rewritten as Swift goes, under [`REVIN_DIR`].
+const LOGIC_DIR: &str = "logic";
+/// The most RevIn may spend (in Claude usage, as dollars) rewriting functions in one study.
+const LOGIC_BUDGET_USD: f64 = 10.0;
 /// The stack whose build starts from RevIn's recovered Swift package.
 const SWIFT_STACK: &str = "SwiftUI (iOS)";
 
@@ -35,7 +39,10 @@ Start from it; don't write these types again elsewhere. Add it to app/project.ym
 and make the app target depend on the modules it needs, so the app is a thin `@main` over them. \
 Then make it work in place: give the types their behaviour (function bodies, computed properties, the views' `body`), \
 keeping each name, field and case as RevIn recovered it. Where the original's code is needed, ask revin_recover_swift with logic true \
-or read Ghidra's pseudocode; capture/revin/swift/ARCHITECTURE.md says which module holds what.";
+or read Ghidra's pseudocode; capture/revin/swift/ARCHITECTURE.md says which module holds what. \
+Where app/Recovered/Sources/<module>/Logic/ exists, those are the original's own functions rewritten as Swift by RevIn \
+(each marked `// RevIn-fn:` with its source): use them as they are, and give each one RevIn left as a stub \
+(\"recovered body did not compile\") its body from the original's pseudocode.";
 
 /// Which system the builder asks for what, in its brief (when RevIn's study output exists).
 pub(super) const ROUTING_BRIEF: &str = "- Two engines studied the original; ask each for what it does best.\n  \
@@ -49,7 +56,9 @@ an Android package's manifest, components and method bytecode (android_package_s
 When capture/revin/dynamic/ has screen_NN.png, those are the original's own screens on an iPhone: match them, \
 and keep the app an iOS app (the person asked to recreate an iOS app); the screenshot check compares your build's picture with them.\n  \
 Strings: use both, capture/revin/swift/RECOVERED_STRINGS.json and native_strings_browse; each finds text the other misses.\n  \
-Don't take sounds or pictures from revin_extract_media: it can add made-up sounds. Use the app's own files.";
+For the app's own pictures and sounds, revin_extract_media copies them out as they are (it adds nothing); \
+don't take findings from revin_hunt_hidden, revin_explore_agents or revin_security_audit as facts about the app: \
+they report template results the app doesn't contain.";
 
 /// An iOS/macOS app (bundle, .ipa) or a Mach-O program.
 pub(super) fn is_apple(path: &Path) -> bool {
@@ -148,6 +157,23 @@ fn seed(from: &Path, app: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// What RevIn's logic pass reported (`LOGIC_REPORT.json`): whether the package with the
+/// rewritten functions built, how many functions it rewrote, how many didn't compile and were left
+/// as stubs, and what it cost.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct Logic {
+    pub builds: bool,
+    pub members: u64,
+    pub stubbed: u64,
+    pub cost_usd: f64,
+}
+
+pub(super) fn logic_report(dir: &Path) -> Option<Logic> {
+    let v: Value = serde_json::from_slice(&std::fs::read(dir.join("LOGIC_REPORT.json")).ok()?).ok()?;
+    let n = |k: &str| v[k].as_u64().unwrap_or(0);
+    Some(Logic { builds: v["build_ok"].as_bool() == Some(true), members: n("members"), stubbed: n("stubbed"), cost_usd: v["cost_usd"].as_f64().unwrap_or(0.0) })
+}
+
 /// A short line from RevIn's recovery report.
 fn report_line(dir: &Path) -> String {
     let Ok(raw) = std::fs::read(dir.join("RECOVERY_REPORT.json")) else { return String::new() };
@@ -172,6 +198,7 @@ impl Worker {
         let has = |id: &str| self.engine.registry().get(id).is_some();
         let apple = has(SWIFT_TOOL) && (is_apple(path) || is_apple(program));
         let apks = if has(ANDROID_TOOL) { android_packages(path) } else { Vec::new() };
+        let simulator = has(SIMULATOR_TOOL);
         if !apple && apks.is_empty() {
             return Ok(String::new());
         }
@@ -197,11 +224,16 @@ impl Worker {
                         report_line(&dir),
                         if builds { "The recovered package builds." } else { "The recovered package doesn't build as it is." }
                     ));
-                    if builds && ws.manifest.stack == SWIFT_STACK {
-                        match seed(&dir, &ws.app_dir()) {
-                            Ok(true) => notes.push_str(&format!("- The rebuild starts from it: copied to app/{RECOVERED_DIR}/.\n")),
-                            Ok(false) => notes.push_str(&format!("- app/{RECOVERED_DIR}/ is already there and is kept.\n")),
-                            Err(e) => notes.push_str(&format!("- It couldn't be copied to app/{RECOVERED_DIR}/ ({e}).\n")),
+                    if ws.manifest.stack == SWIFT_STACK {
+                        // The original's functions as Swift, when the person turned it on: the
+                        // rebuild then starts from them instead of from declarations alone.
+                        let logic = if self.engine.session().settings.revin_logic { self.revin_logic(ws, input, &out, &mut notes)? } else { None };
+                        let from = logic.or(builds.then(|| dir.clone()));
+                        match from.map(|from| seed(&from, &ws.app_dir())) {
+                            Some(Ok(true)) => notes.push_str(&format!("- The rebuild starts from it: copied to app/{RECOVERED_DIR}/.\n")),
+                            Some(Ok(false)) => notes.push_str(&format!("- app/{RECOVERED_DIR}/ is already there and is kept.\n")),
+                            Some(Err(e)) => notes.push_str(&format!("- It couldn't be copied to app/{RECOVERED_DIR}/ ({e}).\n")),
+                            None => {}
                         }
                     }
                 }
@@ -210,7 +242,7 @@ impl Worker {
         }
         // The original running: its screens are the pictures the build is checked against.
         let runtime = self.engine.session().settings.runtime_study;
-        if apple && runtime && has(SIMULATOR_TOOL) {
+        if apple && runtime && simulator {
             self.step(ws, Step::Study, Status::Inspecting, "RevIn is running the original in the iOS Simulator to photograph its screens…")?;
             let dir = out.join(DYNAMIC_DIR);
             let input = if is_apple(path) { path } else { program };
@@ -239,6 +271,38 @@ impl Worker {
             }
         }
         Ok(notes)
+    }
+}
+
+impl Worker {
+    /// RevIn rewrites the original's functions as Swift (Ghidra's pseudocode, through Claude Code)
+    /// into `capture/revin/logic`. Returns that folder when the package with them builds.
+    fn revin_logic(&mut self, ws: &mut Workspace, input: &Path, out: &Path, notes: &mut String) -> Result<Option<PathBuf>, ToolError> {
+        self.step(ws, Step::Study, Status::Inspecting, "RevIn is rewriting the original's functions as Swift (this can take an hour or more)…")?;
+        let dir = out.join(LOGIC_DIR);
+        let params = json!({
+            "input": input.display().to_string(),
+            "output": dir.display().to_string(),
+            "no_extras": true,
+            "logic": true,
+            "logic_backend": "claude",
+            "logic_max_usd": LOGIC_BUDGET_USD,
+        });
+        // RevIn exits with an error when the package doesn't build; its report still says what it did.
+        let called = self.call(SWIFT_TOOL, params);
+        let Some(logic) = logic_report(&dir) else {
+            let why = called.err().map_or_else(|| "it wrote no report".to_string(), |e| e.message);
+            notes.push_str(&format!("- RevIn couldn't rewrite the original's functions ({why}).\n"));
+            return Ok(None);
+        };
+        notes.push_str(&format!(
+            "- RevIn rewrote {} of the original's functions as Swift in capture/{REVIN_DIR}/{LOGIC_DIR}/Sources/*/Logic/ (each marked `// RevIn-fn:`); {} didn't compile and are stubs. It cost about ${:.2}. {}\n",
+            logic.members,
+            logic.stubbed,
+            logic.cost_usd,
+            if logic.builds { "That package builds, so the rebuild starts from it." } else { "That package doesn't build, so the rebuild starts from the declarations; read the functions from there." }
+        ));
+        Ok(logic.builds.then_some(dir))
     }
 }
 
@@ -308,5 +372,16 @@ mod tests {
         std::fs::write(&kit, b"struct A { func go() {} }").unwrap();
         assert!(!seed(&rec, &app).unwrap());
         assert_eq!(std::fs::read(&kit).unwrap(), b"struct A { func go() {} }");
+    }
+
+    #[test]
+    fn the_logic_report_says_whether_the_rewritten_package_builds() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(logic_report(d.path()).is_none(), "no report, no logic");
+        std::fs::write(d.path().join("LOGIC_REPORT.json"), br#"{"build_ok": false, "members": 40, "stubbed": 9, "cost_usd": 1.5}"#).unwrap();
+        let failed = logic_report(d.path()).unwrap();
+        assert!(!failed.builds && failed.stubbed < failed.members);
+        std::fs::write(d.path().join("LOGIC_REPORT.json"), br#"{"build_ok": true, "members": 40}"#).unwrap();
+        assert!(logic_report(d.path()).unwrap().builds);
     }
 }

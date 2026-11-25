@@ -1291,6 +1291,16 @@ fn safety(app: &mut CraftApp, ui: &mut Ui) {
             }
         },
     );
+    row(
+        ui,
+        "Recover the original's code with RevIn",
+        "When RevIn is installed and you rebuild an iOS app, it also rewrites the original's functions as Swift for the rebuild to start from. It uses your Claude plan and can take an hour or more.",
+        |ui| {
+            if widgets::toggle(ui, &mut app.settings.revin_logic, "Recover code").changed() {
+                app.settings_changed();
+            }
+        },
+    );
     if let Some(p) = app.view.project.clone() {
         ui.add_space(theme::space::SM);
         widgets::caption(ui, &format!("{} {}", tr("Allowed in"), p));
