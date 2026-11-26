@@ -55,7 +55,15 @@ Mach-O and libraries (apple_macho_show, apple_dylibs_resolve), finding your way 
 an Android package's manifest, components and method bytecode (android_package_show, android_components_list, android_method_show), and assets as they are (apple_assets_list).\n  \
 When capture/revin/dynamic/ has screen_NN.png, those are the original's own screens on an iPhone: match them, \
 and keep the app an iOS app (the person asked to recreate an iOS app); the screenshot check compares your build's picture with them.\n  \
-Strings: use both, capture/revin/swift/RECOVERED_STRINGS.json and native_strings_browse; each finds text the other misses.\n  \
+Strings: use both, capture/revin/swift/RECOVERED_STRINGS.json and native_strings_browse; each finds text the other misses. \
+RECOVERED_STRINGS.json → strings says which functions use each text (name, address, type): put the text in that type's code.\n  \
+RevIn's RECOVERY_REPORT.json → functions lists every function of the original by module and type with its address: \
+read one's code with native_function_pseudocode at that address before writing it.\n  \
+In capture/revin/dynamic/probe, tap_NN_MM.json says what pressing each control of the original does \
+(what opens, the title after, the texts that appear), with a picture: make the same press do the same. \
+network.json lists the requests the original made, defaults.json its UserDefaults keys and their types, files.json the files it wrote: \
+use the same keys and file names. Craft's check presses the build's controls the same way and compares.\n  \
+capture/revin/swift/Extras/ holds the original's watch app and widgets, recovered and building, should they be asked for.\n  \
 For the app's own pictures and sounds, revin_extract_media copies them out as they are (it adds nothing); \
 don't take findings from revin_hunt_hidden, revin_explore_agents or revin_security_audit as facts about the app: \
 they report template results the app doesn't contain.";
@@ -174,6 +182,34 @@ pub(super) fn logic_report(dir: &Path) -> Option<Logic> {
     Some(Logic { builds: v["build_ok"].as_bool() == Some(true), members: n("members"), stubbed: n("stubbed"), cost_usd: v["cost_usd"].as_f64().unwrap_or(0.0) })
 }
 
+/// What RevIn's probe pressed and saw while the original ran (`DYNAMIC_REPORT.json`), as a notes
+/// line (empty when it says nothing about it).
+fn dynamic_line(dir: &Path) -> String {
+    let Some(v) = std::fs::read(dir.join("DYNAMIC_REPORT.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        return String::new();
+    };
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut bits = Vec::new();
+    if v["taps_summary"].is_object() {
+        bits.push(format!(
+            "it pressed {} control(s) and skipped {} it couldn't press safely (probe/tap_NN_MM.json)",
+            n(&v["taps_summary"]["pressed"]),
+            n(&v["taps_summary"]["skipped"])
+        ));
+    }
+    if v["network"].is_object() {
+        bits.push(format!("the app made {} request(s) (probe/network.json)", n(&v["network"]["requests"])));
+    }
+    if v["app_data"].is_object() {
+        bits.push(format!(
+            "it kept {} UserDefaults key(s) and wrote {} file(s) (probe/defaults.json, probe/files.json)",
+            n(&v["app_data"]["defaults_keys"]),
+            n(&v["app_data"]["files_written"])
+        ));
+    }
+    if bits.is_empty() { String::new() } else { format!("- While it ran, {}.\n", bits.join("; ")) }
+}
+
 /// A short line from RevIn's recovery report.
 fn report_line(dir: &Path) -> String {
     let Ok(raw) = std::fs::read(dir.join("RECOVERY_REPORT.json")) else { return String::new() };
@@ -252,6 +288,7 @@ impl Worker {
                     notes.push_str(&format!(
                         "- The original running in the iOS Simulator: {n} screen(s) in capture/{REVIN_DIR}/{DYNAMIC_DIR}/screen_NN.png, its UI tree per screen in probe/, its log and URLs. The build is checked against these screens.\n"
                     ));
+                    notes.push_str(&dynamic_line(&dir));
                 }
                 Err(e) => {
                     notes.push_str(&format!("- The original couldn't be run in the Simulator ({}), so the build isn't compared with its screens.\n", e.message))
@@ -383,5 +420,18 @@ mod tests {
         assert!(!failed.builds && failed.stubbed < failed.members);
         std::fs::write(d.path().join("LOGIC_REPORT.json"), br#"{"build_ok": true, "members": 40}"#).unwrap();
         assert!(logic_report(d.path()).unwrap().builds);
+    }
+
+    #[test]
+    fn the_probe_line_says_what_was_pressed_and_kept() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(dynamic_line(d.path()).is_empty());
+        std::fs::write(
+            d.path().join("DYNAMIC_REPORT.json"),
+            br#"{"taps_summary": {"pressed": 13, "skipped": 3}, "network": {"requests": 0}, "app_data": {"defaults_keys": 4, "files_written": 5}}"#,
+        )
+        .unwrap();
+        let line = dynamic_line(d.path());
+        assert!(line.contains("pressed 13") && line.contains("4 UserDefaults") && line.contains("0 request"), "{line}");
     }
 }

@@ -5,8 +5,12 @@
 //! build and hold the original's buttons (claims, so they decide); how alike each tab looks and
 //! how many of its texts the build shows are advisory, as content can differ between runs.
 //!
-//! What this shows about behaviour: the build starts, every tab opens and has its controls, and
-//! it doesn't stop while being driven. What the controls do when tapped is not checked here.
+//! RevIn's probe then presses each tab's buttons (and types a short text into plain fields) and
+//! records what changed (`probe/tap_NN_MM.json`): what opened, the title after, the texts that
+//! appeared. Each of the original's presses is a claim: the same button on the same tab of the
+//! build must open the same kind of thing, reach the same title and show most of the same new
+//! texts. What can't be pressed safely (deleting, buying, sending to other devices) the probe
+//! skips in both, so it isn't checked.
 
 use super::*;
 use craft_anything_engine::tools::web_common::decode_png;
@@ -33,6 +37,12 @@ pub struct Screen {
 
 fn key(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// A shown text as compared between runs: its digits don't count, as times, counts and versions
+/// differ from one run to the next ("19:06:07 session active" is the same line at 19:21:03).
+fn text_key(s: &str) -> String {
+    key(s).chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect()
 }
 
 /// The screens in a RevIn run's output folder (`probe/ui_NN.json` with `screen_NN.png`), in order.
@@ -66,7 +76,7 @@ pub fn screens(dir: &Path) -> Vec<Screen> {
                 }
                 let label = ["label", "text", "value"].iter().find_map(|k| n[*k].as_str().map(str::trim).filter(|t| !t.is_empty()));
                 let Some(label) = label else { continue };
-                s.texts.insert(key(label));
+                s.texts.insert(text_key(label));
                 if n["traits"].as_u64().is_some_and(|t| t & TRAIT_BUTTON != 0) && seen.insert(key(label)) {
                     s.buttons.push(label.to_string());
                 }
@@ -74,6 +84,87 @@ pub fn screens(dir: &Path) -> Vec<Screen> {
             Some(s)
         })
         .collect()
+}
+
+/// One press of the probe: on which tab, which control, and what changed.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Tap {
+    pub screen: String,
+    pub button: String,
+    /// What it opened: sheet, alert, push, tab, window, closed or none.
+    pub opened: String,
+    /// The title after the press, when it changed.
+    pub title: Option<String>,
+    /// Texts that appeared (the probe's own typed text left out).
+    pub added: BTreeSet<String>,
+}
+
+/// The probe's presses in a RevIn run's folder (`probe/tap_NN_MM.json`), each with its tab's title.
+pub fn taps(dir: &Path) -> Vec<Tap> {
+    let probe = dir.join("probe");
+    let read = |p: &Path| std::fs::read(p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let mut titles = std::collections::BTreeMap::new();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&probe).into_iter().flatten().flatten().map(|e| e.path()).collect();
+    files.sort();
+    for f in &files {
+        if f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("ui_"))
+            && let Some(doc) = read(f)
+        {
+            titles.insert(doc["screen"].as_u64().unwrap_or(0), doc["title"].as_str().unwrap_or_default().trim().to_string());
+        }
+    }
+    files
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tap_")) && f.extension().is_some_and(|e| e == "json"))
+        .filter_map(|f| {
+            let doc = read(f)?;
+            let button = doc["button"].as_str()?.trim().to_string();
+            let screen = titles.get(&doc["screen"].as_u64()?).cloned().unwrap_or_default();
+            let typed = doc["typed"].as_str().map(text_key);
+            let words = |k: &str| -> BTreeSet<String> { doc[k].as_array().into_iter().flatten().filter_map(Value::as_str).map(text_key).collect() };
+            let mut added = words("texts_added");
+            if let Some(t) = &typed {
+                added.remove(t);
+            }
+            let (before, after) = (doc["before_title"].as_str().unwrap_or_default(), doc["after_title"].as_str().unwrap_or_default());
+            let title = (key(before) != key(after) && !after.trim().is_empty()).then(|| after.trim().to_string());
+            Some(Tap { screen, button, opened: doc["opened"].as_str().unwrap_or("none").to_string(), title, added })
+        })
+        .collect()
+}
+
+/// Compare what each of the original's presses did with the same press in the build.
+pub fn compare_taps(original: &[Tap], build: &[Tap]) -> (String, Vec<Claim>) {
+    let mut claims = Vec::new();
+    for o in original {
+        let what = format!("Pressing \"{}\" on the \"{}\" tab does what it does in the original", o.button, o.screen);
+        let found = build.iter().find(|b| key(&b.screen) == key(&o.screen) && key(&b.button) == key(&o.button));
+        let Some(b) = found else {
+            claims.push(Claim::new(what, false, "the build's probe found no such control there to press"));
+            continue;
+        };
+        let mut wrong = Vec::new();
+        if b.opened != o.opened {
+            wrong.push(format!("the original opened {}, the build {}", o.opened, b.opened));
+        }
+        if let Some(t) = &o.title
+            && b.title.as_deref().map(key) != Some(key(t))
+        {
+            wrong.push(format!("the original went to \"{t}\", the build to \"{}\"", b.title.as_deref().unwrap_or("the same screen")));
+        }
+        // Most of what appeared must appear: content can differ in a detail between runs.
+        let shown = o.added.intersection(&b.added).count();
+        if !o.added.is_empty() && shown * 2 < o.added.len() {
+            let missing: Vec<&str> = o.added.difference(&b.added).take(3).map(String::as_str).collect();
+            wrong.push(format!("{shown} of the {} texts the original showed appeared (missing: {})", o.added.len(), missing.join(", ")));
+        }
+        claims.push(Claim::new(what, wrong.is_empty(), wrong.join("; ")));
+    }
+    claims.truncate(MAX_CLAIMS);
+    let same = claims.iter().filter(|c| c.passed).count();
+    let note =
+        if original.is_empty() { String::new() } else { format!(" Pressing the original's controls: {same} of {} do the same in the build.", claims.len()) };
+    (note, claims)
 }
 
 /// The build's screen with the original's title, if it has one.
@@ -115,10 +206,7 @@ pub fn compare(original: &[Screen], build: &[Screen]) -> (String, Vec<Claim>) {
         parts.push(format!("{name}: {}", if bits.is_empty() { "opens".to_string() } else { bits.join(", ") }));
     }
     claims.truncate(MAX_CLAIMS);
-    let note = format!(
-        " Tab by tab (RevIn ran the build the way it ran the original): {}. Which tabs open and which buttons they have is checked; what a tap does is not.",
-        parts.join("; ")
-    );
+    let note = format!(" Tab by tab (RevIn ran the build the way it ran the original): {}.", parts.join("; "));
     (note, claims)
 }
 
@@ -139,7 +227,16 @@ pub fn tabs_note(cx: &CheckCx, app: &Path, dir: &Path) -> (String, Vec<Claim>) {
     if build.is_empty() {
         return (" RevIn ran the build but its probe saw no screens, so the tabs weren't compared.".into(), Vec::new());
     }
-    compare(&original, &build)
+    let (mut note, mut claims) = compare(&original, &build);
+    let pressed = taps(&original_dir);
+    if pressed.is_empty() {
+        note.push_str(" The original's controls weren't pressed in Study, so what a press does isn't compared.");
+    } else {
+        let (tap_note, tap_claims) = compare_taps(&pressed, &taps(&out));
+        note.push_str(&tap_note);
+        claims.extend(tap_claims);
+    }
+    (note, claims)
 }
 
 #[cfg(test)]
@@ -183,6 +280,50 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod tap_tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, doc: Value) {
+        std::fs::create_dir_all(dir.join("probe")).unwrap();
+        std::fs::write(dir.join("probe").join(name), serde_json::to_vec(&doc).unwrap()).unwrap();
+    }
+
+    fn run(dir: &Path, tv_opens: &str, tv_shows: &[&str]) {
+        write(dir, "ui_02.json", json!({"title": "Lab", "screen": 2, "windows": []}));
+        write(
+            dir,
+            "tap_02_00.json",
+            json!({"screen": 2, "button": "TV", "opened": tv_opens, "before_title": "Link", "after_title": "TV", "texts_added": tv_shows}),
+        );
+        write(dir, "tap_02_01.json", json!({"screen": 2, "button": "Message", "opened": "none", "typed": "RevIn test", "texts_added": ["RevIn test"]}));
+    }
+
+    #[test]
+    fn a_press_that_opens_something_else_or_shows_less_fails_its_claim() {
+        let d = tempfile::tempdir().unwrap();
+        let (o, b) = (d.path().join("o"), d.path().join("b"));
+        run(&o, "none", &["TV address", "Find", "not connected"]);
+        let original = taps(&o);
+        assert_eq!(original[0].screen, "Lab", "a press knows its tab's title");
+        assert!(original[1].added.is_empty(), "the probe's own typed text isn't something the app showed");
+
+        run(&b, "sheet", &["TV address"]);
+        let (note, claims) = compare_taps(&original, &taps(&b));
+        let tv = claims.iter().find(|c| c.title.contains("\"TV\"")).unwrap();
+        assert!(!tv.passed && tv.detail.contains("sheet") && tv.detail.contains("texts"), "{tv:?}");
+        assert!(claims.iter().any(|c| c.passed && c.title.contains("\"Message\"")), "{claims:?}");
+        assert!(note.contains("1 of 2"), "{note}");
+
+        let empty = d.path().join("e");
+        write(&empty, "ui_02.json", json!({"title": "Lab", "screen": 2, "windows": []}));
+        assert!(compare_taps(&original, &taps(&empty)).1.iter().all(|c| !c.passed), "an unpressed control fails");
+
+        run(&b, "none", &["tv  address", "Find", "Something new"]);
+        assert!(compare_taps(&original, &taps(&b)).1.iter().all(|c| c.passed), "most of the same texts and the same title pass");
+    }
+}
+
 /// Compares two real RevIn runs when `IOS_TABS_ORIGINAL` and `IOS_TABS_BUILD` name their folders.
 #[cfg(test)]
 mod live {
@@ -197,5 +338,10 @@ mod live {
             println!("{} {} {}", if c.passed { "PASS" } else { "FAIL" }, c.title, c.detail);
         }
         assert!(claims.iter().any(|c| c.title.contains("tab opens")), "every tab gets a claim");
+        let (note, claims) = super::compare_taps(&super::taps(std::path::Path::new(&o)), &super::taps(std::path::Path::new(&b)));
+        println!("{note}");
+        for c in &claims {
+            println!("{} {} {}", if c.passed { "PASS" } else { "FAIL" }, c.title, c.detail);
+        }
     }
 }
